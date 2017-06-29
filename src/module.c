@@ -5,7 +5,6 @@
 #include <sys/param.h>
 #include <time.h>
 
-
 #include "commands.h"
 #include "version.h"
 #include "forward_index.h"
@@ -1126,6 +1125,7 @@ int SuggestGetCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
 int RediSearch_InitModuleInternal(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
+  // Check that redis supports thread safe context. RC3 or below doesn't
   if (RedisModule_GetThreadSafeContext == NULL) {
     RedisModule_Log(ctx, "warning",
                     "***** FATAL: Incompatible version of redis 4.0 detected. *****\n"
