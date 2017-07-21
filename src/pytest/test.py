@@ -450,8 +450,6 @@ class SearchTestCase(ModuleTestCase('../redisearch.so')):
                 self.assertTrue(s2.intersection(s1) == set())
                 self.assertTrue(s3.intersection(s1) == set())
 
-
-            # NOT on a non existing term
             self.assertEqual(r.execute_command(
                 'ft.search', 'idx', 'constant -dasdfasdf', 'nocontent')[0], N)
             # not on self term
@@ -1042,6 +1040,25 @@ class SearchTestCase(ModuleTestCase('../redisearch.so')):
         for x in range(1, 5):
             for combo in combinations(('NOOFSETS', 'NOFREQS', 'NOFIELDS', ''), x):
                 self._test_create_options_real(*combo)
+
+    def testInfoCommand(self):
+        from itertools import combinations
+
+        for x in range(1, 5):
+            for combo in combinations(('NOOFFSETS', 'NOFREQS', 'NOFIELDS'), x):
+                options = list(combo) + ['schema', 'f1', 'text']
+                try:
+                    self.cmd('ft.drop', 'idx')
+                except:
+                    pass
+
+                self.assertCmdOk('ft.create', 'idx', *options)
+                info = self.cmd('ft.info', 'idx')
+                ix = info.index('index_options')
+                self.assertFalse(ix == -1)
+                value = info[ix + 1]
+                for option in combo:
+                    self.assertTrue(option in value)
 
 
 def grouper(iterable, n, fillvalue=None):
