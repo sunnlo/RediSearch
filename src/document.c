@@ -23,118 +23,149 @@
 #include "search_request.h"
 #include "rmalloc.h"
 
+static int Document_Store(Document *doc, RedisSearchCtx *ctx, int nosave, int replace,
+                          const char **errorString) {
+  const char *keystr = RedisModule_StringPtrLen(doc->docKey, NULL);
+  DocTable *table = &ctx->spec->docs;
+
+  // if we're in replace mode, first we need to try and delete the older version of the document
+  if (replace) {
+    DocTable_Delete(table, keystr);
+  }
+  doc->docId = DocTable_Put(table, keystr, doc->score, 0, doc->payload, doc->payloadSize);
+
+  // Make sure the document is not already in the index - it needs to be
+  // incremental!
+  if (doc->docId == 0) {
+    *errorString = "Couldn't allocate new document table entry";
+    return -1;
+  }
+
+  if (!nosave) {
+    // first save the document as hash
+    if (REDISMODULE_ERR == Redis_SaveDocument(ctx, doc)) {
+      *errorString = "Couldn't save document";
+      goto fail;
+    }
+  }
+
+  return 0;
+
+fail:
+  DocTable_Delete(table, keystr);
+  return -1;
+}
+
+typedef struct {
+  ForwardIndex *idx;
+  RSSortingVector *sv;
+  Document *doc;
+  size_t totalTokens;
+} indexingContext;
+
+static void ensureSortingVector(RedisSearchCtx *sctx, indexingContext *ictx) {
+  if (!ictx->sv) {
+    ictx->sv = NewSortingVector(sctx->spec->sortables->len);
+  }
+}
+
+static int indexField(RedisSearchCtx *ctx, const DocumentField *field, const char **errorString,
+                      indexingContext *ictx) {
+  // printf("Tokenizing %s: %s\n",
+  // RedisModule_StringPtrLen(doc.fields[i].name, NULL),
+  //        RedisModule_StringPtrLen(doc.fields[i].text, NULL));
+
+  const FieldSpec *fs = IndexSpec_GetField(ctx->spec, field->name, strlen(field->name));
+  if (fs == NULL) {
+    LG_DEBUG("Skipping field %s not in index!", field->name);
+    return 0;
+  }
+
+  const char *c = RedisModule_StringPtrLen(field->text, NULL);
+
+  switch (fs->type) {
+    case F_FULLTEXT:
+      if (fs->sortable) {
+        ensureSortingVector(ctx, ictx);
+        RSSortingVector_Put(ictx->sv, fs->sortIdx, (void *)c, RS_SORTABLE_STR);
+      }
+
+      ictx->totalTokens = tokenize(c, fs->weight, fs->id, ictx->idx, forwardIndexTokenFunc,
+                                   ictx->idx->stemmer, ictx->totalTokens, ctx->spec->stopwords);
+      break;
+    case F_NUMERIC: {
+      double score;
+
+      if (RedisModule_StringToDouble(field->text, &score) == REDISMODULE_ERR) {
+        *errorString = "Could not parse numeric index value";
+        return -1;
+      }
+
+      NumericRangeTree *rt = OpenNumericIndex(ctx, fs->name);
+      NumericRangeTree_Add(rt, ictx->doc->docId, score);
+
+      // If this is a sortable numeric value - copy the value to the sorting vector
+      if (fs->sortable) {
+        ensureSortingVector(ctx, ictx);
+        RSSortingVector_Put(ictx->sv, fs->sortIdx, &score, RS_SORTABLE_NUM);
+      }
+      break;
+    }
+    case F_GEO: {
+
+      char *pos = strpbrk(c, " ,");
+      if (!pos) {
+        *errorString = "Invalid lon/lat format. Use \"lon lat\" or \"lon,lat\"";
+        return -1;
+      }
+      *pos = '\0';
+      pos++;
+      char *slon = (char *)c, *slat = (char *)pos;
+
+      GeoIndex gi = {.ctx = ctx, .sp = fs};
+      if (GeoIndex_AddStrings(&gi, ictx->doc->docId, slon, slat) == REDISMODULE_ERR) {
+        *errorString = "Could not index geo value";
+        return -1;
+      }
+    }
+    default:
+      break;
+  }
+  return 0;
+}
+
 /* Add a parsed document to the index. If replace is set, we will add it be deleting an older
  * version of it first */
 int Document_AddToIndexes(Document *doc, RedisSearchCtx *ctx, const char **errorString,
                           int options) {
-  int isnew = 1;
   int replace = options & DOCUMENT_ADD_REPLACE;
   int nosave = options & DOCUMENT_ADD_NOSAVE;
 
-  // if we're in replace mode, first we need to try and delete the older version of the document
-  if (replace) {
-    DocTable_Delete(&ctx->spec->docs, RedisModule_StringPtrLen(doc->docKey, NULL));
-  }
-
-  doc->docId = DocTable_Put(&ctx->spec->docs, RedisModule_StringPtrLen(doc->docKey, NULL),
-                            doc->score, 0, doc->payload, doc->payloadSize);
-
-  // Make sure the document is not already in the index - it needs to be
-  // incremental!
-  if (doc->docId == 0 || !isnew) {
-    *errorString = "Document already in index";
-    return REDISMODULE_ERR;
-  }
-
-  // first save the document as hash
-  if (nosave == 0 && Redis_SaveDocument(ctx, doc) != REDISMODULE_OK) {
-    *errorString = "Could not save document data";
+  if (Document_Store(doc, ctx, nosave, replace, errorString) != 0) {
     return REDISMODULE_ERR;
   }
 
   ForwardIndex *idx = NewForwardIndex(doc);
-  RSSortingVector *sv = NULL;
-  if (ctx->spec->sortables) {
-    sv = NewSortingVector(ctx->spec->sortables->len);
-  }
-
-  int totalTokens = 0;
+  indexingContext ictx = {.idx = idx, .doc = doc, .totalTokens = 0};
 
   for (int i = 0; i < doc->numFields; i++) {
     // printf("Tokenizing %s: %s\n",
     // RedisModule_StringPtrLen(doc.fields[i].name, NULL),
     //        RedisModule_StringPtrLen(doc.fields[i].text, NULL));
 
-    size_t len;
-    const char *f = doc->fields[i].name;
-    len = strlen(f);
-    const char *c = RedisModule_StringPtrLen(doc->fields[i].text, NULL);
-
-    FieldSpec *fs = IndexSpec_GetField(ctx->spec, f, len);
-    if (fs == NULL) {
-      LG_DEBUG("Skipping field %s not in index!", c);
-      continue;
-    }
-
-    switch (fs->type) {
-      case F_FULLTEXT:
-        if (sv && fs->sortable) {
-          RSSortingVector_Put(sv, fs->sortIdx, (void *)c, RS_SORTABLE_STR);
-        }
-
-        totalTokens = tokenize(c, fs->weight, fs->id, idx, forwardIndexTokenFunc, idx->stemmer,
-                               totalTokens, ctx->spec->stopwords);
-        break;
-      case F_NUMERIC: {
-        double score;
-
-        if (RedisModule_StringToDouble(doc->fields[i].text, &score) == REDISMODULE_ERR) {
-          *errorString = "Could not parse numeric index value";
-          goto error;
-        }
-
-        NumericRangeTree *rt = OpenNumericIndex(ctx, fs->name);
-        NumericRangeTree_Add(rt, doc->docId, score);
-
-        // If this is a sortable numeric value - copy the value to the sorting vector
-        if (sv && fs->sortable) {
-          RSSortingVector_Put(sv, fs->sortIdx, &score, RS_SORTABLE_NUM);
-        }
-        break;
-      }
-      case F_GEO: {
-
-        char *pos = strpbrk(c, " ,");
-        if (!pos) {
-          *errorString = "Invalid lon/lat format. Use \"lon lat\" or \"lon,lat\"";
-          goto error;
-        }
-        *pos = '\0';
-        pos++;
-        char *slon = (char *)c, *slat = (char *)pos;
-
-        GeoIndex gi = {.ctx = ctx, .sp = fs};
-        if (GeoIndex_AddStrings(&gi, doc->docId, slon, slat) == REDISMODULE_ERR) {
-          *errorString = "Could not index geo value";
-          goto error;
-        }
-      }
-
-      break;
-
-      default:
-        break;
+    if (indexField(ctx, &doc->fields[i], errorString, &ictx) == -1) {
+      goto error;
     }
   }
 
   RSDocumentMetadata *md = DocTable_Get(&ctx->spec->docs, doc->docId);
   md->maxFreq = idx->maxFreq;
-  if (sv) {
-    DocTable_SetSortingVector(&ctx->spec->docs, doc->docId, sv);
+  if (ictx.sv) {
+    DocTable_SetSortingVector(&ctx->spec->docs, doc->docId, ictx.sv);
   }
 
   // printf("totaltokens :%d\n", totalTokens);
-  if (totalTokens > 0) {
+  if (ictx.totalTokens > 0) {
     ForwardIndexIterator it = ForwardIndex_Iterate(idx);
 
     ForwardIndexEntry *entry = ForwardIndexIterator_Next(&it);
@@ -180,6 +211,9 @@ int Document_AddToIndexes(Document *doc, RedisSearchCtx *ctx, const char **error
 
 error:
   ForwardIndexFree(idx);
+  if (ictx.sv) {
+    SortingVector_Free(ictx.sv);
+  }
 
   return REDISMODULE_ERR;
 }
